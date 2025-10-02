@@ -4,6 +4,7 @@ import * as E from "fp-ts/Either"
 import { z } from "zod"
 
 import { Service } from "dioc"
+import { watch } from "vue"
 import { StorageLike, watchDebounced } from "@vueuse/core"
 import { assign, clone, isEmpty } from "lodash-es"
 
@@ -94,6 +95,7 @@ import {
 import { PersistableTabState } from "../tab"
 import { HoppTabDocument } from "~/helpers/rest/document"
 import { HoppGQLDocument } from "~/helpers/graphql/document"
+import { WorkspaceService, Workspace } from "~/services/workspace.service"
 import {
   CurrentValueService,
   Variable,
@@ -129,6 +131,9 @@ export const STORE_KEYS = {
   CURRENT_ENVIRONMENT_VALUE: "currentEnvironmentValue",
   CURRENT_SORT_VALUES: "currentSortValues",
   SCHEMA_VERSION: "schema_version",
+  // New: Per-workspace tab state (non-breaking; legacy keys still read for migration)
+  REST_TABS_BY_WS: "restTabsByWorkspace",
+  GQL_TABS_BY_WS: "gqlTabsByWorkspace",
 } as const
 
 interface Migration {
@@ -196,6 +201,13 @@ export class PersistenceService extends Service {
   private readonly currentSortValuesService = this.bind(
     CurrentSortValuesService
   )
+
+  // Workspace-aware helpers
+  private readonly workspaceService = this.bind(WorkspaceService)
+
+  private workspaceKeyOf(ws: Workspace): string {
+    return ws.type === "personal" ? "personal" : `team:${ws.teamID}`
+  }
 
   private showErrorToast(key: string) {
     const toast = useToast()
@@ -918,96 +930,228 @@ export class PersistenceService extends Service {
   }
 
   private async setupRESTTabsPersistence() {
-    const loadResult = await Store.get<any>(
+    // New workspace-scoped persistence with migration from legacy single-state
+    type TabStateMap = Record<string, PersistableTabState<HoppTabDocument>>
+
+    // Attempt to load workspace-scoped map first
+    let wsTabMap: TabStateMap = {}
+    const wsLoad = await Store.get<any>(
       STORE_NAMESPACE,
-      STORE_KEYS.REST_TABS
+      STORE_KEYS.REST_TABS_BY_WS
     )
-
-    try {
-      if (E.isRight(loadResult) && loadResult.right) {
-        // Correcting the request schema for broken data
-        const orderedDocs = fixBrokenRequestVersion(
-          cloneDeep(loadResult.right.orderedDocs) ?? []
-        )
-
-        const transformedTabs = {
-          ...loadResult.right,
-          orderedDocs,
-        }
-        const result = REST_TAB_STATE_SCHEMA.safeParse(transformedTabs)
-        if (result.success) {
-          // SAFETY: We know the schema matches
-          this.restTabService.loadTabsFromPersistedState(
-            result.data as PersistableTabState<HoppTabDocument>
-          )
-        } else {
-          this.showErrorToast(STORE_KEYS.REST_TABS)
-          await Store.set(
-            STORE_NAMESPACE,
-            `${STORE_KEYS.REST_TABS}-backup`,
-            loadResult.right
-          )
-          console.error(
-            `Failed parsing persisted REST_TABS:`,
-            JSON.stringify(loadResult.right)
-          )
-          // NOTE: Still loading data to match legacy behavior
-          this.restTabService.loadTabsFromPersistedState(loadResult.right)
-        }
+    if (E.isRight(wsLoad) && wsLoad.right) {
+      try {
+        wsTabMap = wsLoad.right as TabStateMap
+      } catch (e) {
+        console.error("Failed parsing REST_TABS_BY_WS:", wsLoad)
+        wsTabMap = {}
       }
-    } catch (e) {
-      console.error(`Failed parsing persisted REST_TABS:`, loadResult)
     }
 
+    const currentWS = this.workspaceService.currentWorkspace.value
+    let currentKey = this.workspaceKeyOf(currentWS)
+
+    // If no workspace-scoped data yet, migrate from legacy REST_TABS if present
+    if (Object.keys(wsTabMap).length === 0) {
+      const legacyLoad = await Store.get<any>(
+        STORE_NAMESPACE,
+        STORE_KEYS.REST_TABS
+      )
+      try {
+        if (E.isRight(legacyLoad) && legacyLoad.right) {
+          const orderedDocs = fixBrokenRequestVersion(
+            cloneDeep(legacyLoad.right.orderedDocs) ?? []
+          )
+          const transformedTabs = {
+            ...legacyLoad.right,
+            orderedDocs,
+          }
+          const result = REST_TAB_STATE_SCHEMA.safeParse(transformedTabs)
+          if (result.success) {
+            wsTabMap[currentKey] = result.data as PersistableTabState<HoppTabDocument>
+          } else {
+            this.showErrorToast(STORE_KEYS.REST_TABS)
+            await Store.set(
+              STORE_NAMESPACE,
+              `${STORE_KEYS.REST_TABS}-backup`,
+              legacyLoad.right
+            )
+            console.error(
+              `Failed parsing persisted REST_TABS:`,
+              JSON.stringify(legacyLoad.right)
+            )
+            // Fallback: still keep legacy data as-is
+            wsTabMap[currentKey] = legacyLoad.right as PersistableTabState<HoppTabDocument>
+          }
+        }
+      } catch (e) {
+        console.error(`Failed parsing persisted REST_TABS:`, legacyLoad)
+      }
+    }
+
+    // Load current workspace tabs or default
+    const ensureDefaultAndLoad = async (key: string) => {
+      if (wsTabMap[key]) {
+        this.restTabService.loadTabsFromPersistedState(wsTabMap[key])
+      } else {
+        // Default: one empty REST request tab
+        const { getDefaultRESTRequest } = await import("~/helpers/rest/default")
+        const defaultState: PersistableTabState<HoppTabDocument> = {
+          lastActiveTabID: "test",
+          orderedDocs: [
+            {
+              tabID: "test",
+              doc: {
+                type: "request",
+                request: getDefaultRESTRequest(),
+                isDirty: false,
+                optionTabPreference: "params",
+              },
+            },
+          ],
+        }
+        wsTabMap[key] = defaultState
+        this.restTabService.loadTabsFromPersistedState(defaultState)
+      }
+    }
+
+    await ensureDefaultAndLoad(currentKey)
+    await Store.set(STORE_NAMESPACE, STORE_KEYS.REST_TABS_BY_WS, wsTabMap)
+
+    // Persist changes for the active workspace
     watchDebounced(
       this.restTabService.persistableTabState,
       async (newData) => {
-        await Store.set(STORE_NAMESPACE, STORE_KEYS.REST_TABS, newData)
+        const activeKey = this.workspaceKeyOf(this.workspaceService.currentWorkspace.value)
+        wsTabMap[activeKey] = newData
+        await Store.set(STORE_NAMESPACE, STORE_KEYS.REST_TABS_BY_WS, wsTabMap)
       },
       { debounce: 500, deep: true }
+    )
+
+    // Swap visible tabs on workspace change
+    watch(
+      () => this.workspaceService.currentWorkspace.value,
+      async (newWS, oldWS) => {
+        const prevKey = this.workspaceKeyOf(oldWS ?? currentWS)
+        const nextKey = this.workspaceKeyOf(newWS)
+        // Save current state under previous workspace
+        wsTabMap[prevKey] = this.restTabService.persistableTabState.value
+        await Store.set(
+          STORE_NAMESPACE,
+          STORE_KEYS.REST_TABS_BY_WS,
+          wsTabMap
+        )
+
+        // Load next workspace state (or default)
+        await ensureDefaultAndLoad(nextKey)
+      },
+      { deep: false }
     )
   }
 
   private async setupGQLTabsPersistence() {
-    const loadResult = await Store.get<any>(
+    // New workspace-scoped persistence with migration from legacy single-state
+    type TabStateMap = Record<string, PersistableTabState<HoppGQLDocument>>
+
+    let wsTabMap: TabStateMap = {}
+    const wsLoad = await Store.get<any>(
       STORE_NAMESPACE,
-      STORE_KEYS.GQL_TABS
+      STORE_KEYS.GQL_TABS_BY_WS
     )
-
-    try {
-      if (E.isRight(loadResult) && loadResult.right) {
-        const result = GQL_TAB_STATE_SCHEMA.safeParse(loadResult.right)
-
-        if (result.success) {
-          // SAFETY: We know the schema matches
-          this.gqlTabService.loadTabsFromPersistedState(
-            result.data as PersistableTabState<HoppGQLDocument>
-          )
-        } else {
-          this.showErrorToast(STORE_KEYS.GQL_TABS)
-          await Store.set(
-            STORE_NAMESPACE,
-            `${STORE_KEYS.GQL_TABS}-backup`,
-            loadResult.right
-          )
-          console.error(
-            `Failed parsing persisted GQL_TABS:`,
-            JSON.stringify(loadResult.right)
-          )
-          // NOTE: Still loading data to match legacy behavior
-          this.gqlTabService.loadTabsFromPersistedState(loadResult.right)
-        }
+    if (E.isRight(wsLoad) && wsLoad.right) {
+      try {
+        wsTabMap = wsLoad.right as TabStateMap
+      } catch (e) {
+        console.error("Failed parsing GQL_TABS_BY_WS:", wsLoad)
+        wsTabMap = {}
       }
-    } catch (e) {
-      console.error(`Failed parsing persisted GQL_TABS:`, loadResult)
     }
+
+    const currentWS = this.workspaceService.currentWorkspace.value
+    let currentKey = this.workspaceKeyOf(currentWS)
+
+    if (Object.keys(wsTabMap).length === 0) {
+      const legacyLoad = await Store.get<any>(
+        STORE_NAMESPACE,
+        STORE_KEYS.GQL_TABS
+      )
+      try {
+        if (E.isRight(legacyLoad) && legacyLoad.right) {
+          const result = GQL_TAB_STATE_SCHEMA.safeParse(legacyLoad.right)
+          if (result.success) {
+            wsTabMap[currentKey] = result.data as PersistableTabState<HoppGQLDocument>
+          } else {
+            this.showErrorToast(STORE_KEYS.GQL_TABS)
+            await Store.set(
+              STORE_NAMESPACE,
+              `${STORE_KEYS.GQL_TABS}-backup`,
+              legacyLoad.right
+            )
+            console.error(
+              `Failed parsing persisted GQL_TABS:`,
+              JSON.stringify(legacyLoad.right)
+            )
+            wsTabMap[currentKey] = legacyLoad.right as PersistableTabState<HoppGQLDocument>
+          }
+        }
+      } catch (e) {
+        console.error(`Failed parsing persisted GQL_TABS:`, legacyLoad)
+      }
+    }
+
+    const ensureDefaultAndLoad = async (key: string) => {
+      if (wsTabMap[key]) {
+        this.gqlTabService.loadTabsFromPersistedState(wsTabMap[key])
+      } else {
+        const { getDefaultGQLRequest } = await import("~/helpers/graphql/default")
+        const defaultState: PersistableTabState<HoppGQLDocument> = {
+          lastActiveTabID: "test",
+          orderedDocs: [
+            {
+              tabID: "test",
+              doc: {
+                request: getDefaultGQLRequest(),
+                isDirty: false,
+                optionTabPreference: "query",
+                cursorPosition: 0,
+              },
+            },
+          ],
+        }
+        wsTabMap[key] = defaultState
+        this.gqlTabService.loadTabsFromPersistedState(defaultState)
+      }
+    }
+
+    await ensureDefaultAndLoad(currentKey)
+    await Store.set(STORE_NAMESPACE, STORE_KEYS.GQL_TABS_BY_WS, wsTabMap)
 
     watchDebounced(
       this.gqlTabService.persistableTabState,
       async (newData) => {
-        await Store.set(STORE_NAMESPACE, STORE_KEYS.GQL_TABS, newData)
+        const activeKey = this.workspaceKeyOf(this.workspaceService.currentWorkspace.value)
+        wsTabMap[activeKey] = newData
+        await Store.set(STORE_NAMESPACE, STORE_KEYS.GQL_TABS_BY_WS, wsTabMap)
       },
       { debounce: 500, deep: true }
+    )
+
+    watch(
+      () => this.workspaceService.currentWorkspace.value,
+      async (newWS, oldWS) => {
+        const prevKey = this.workspaceKeyOf(oldWS ?? currentWS)
+        const nextKey = this.workspaceKeyOf(newWS)
+        wsTabMap[prevKey] = this.gqlTabService.persistableTabState.value
+        await Store.set(
+          STORE_NAMESPACE,
+          STORE_KEYS.GQL_TABS_BY_WS,
+          wsTabMap
+        )
+
+        await ensureDefaultAndLoad(nextKey)
+      },
+      { deep: false }
     )
   }
 

@@ -4,6 +4,7 @@ import { getDefaultRESTRequest } from "~/helpers/rest/default"
 import { HoppRESTSaveContext, HoppTabDocument } from "~/helpers/rest/document"
 import { getService } from "~/modules/dioc"
 import { PersistenceService, STORE_KEYS } from "../persistence"
+import { WorkspaceService, Workspace } from "~/services/workspace.service"
 import { TabService } from "./tab"
 import { PersistableTabState } from "."
 
@@ -64,10 +65,21 @@ export class RESTTabService extends TabService<HoppTabDocument> {
 
   protected async loadPersistedState(): Promise<PersistableTabState<HoppTabDocument> | null> {
     const persistenceService = getService(PersistenceService)
-    const savedState = await persistenceService.getNullable<
-      PersistableTabState<HoppTabDocument>
-    >(STORE_KEYS.REST_TABS)
-    return savedState
+    const workspaceService = getService(WorkspaceService)
+
+    const ws = workspaceService.currentWorkspace.value
+    const key = ws.type === "personal" ? "personal" : `team:${ws.teamID}`
+
+    // Try new per-workspace storage first
+    const byWS = await persistenceService.getNullable<Record<string, PersistableTabState<HoppTabDocument>>>(
+      STORE_KEYS.REST_TABS_BY_WS as any
+    )
+    if (byWS && byWS[key]) return byWS[key]
+
+    // Fallback to legacy single-state
+    return await persistenceService.getNullable<PersistableTabState<HoppTabDocument>>(
+      STORE_KEYS.REST_TABS
+    )
   }
 
   public getTabRefWithSaveContext(ctx: HoppRESTSaveContext) {

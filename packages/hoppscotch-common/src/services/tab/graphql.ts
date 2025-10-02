@@ -6,6 +6,7 @@ import { computed } from "vue"
 import { Container } from "dioc"
 import { getService } from "~/modules/dioc"
 import { PersistenceService, STORE_KEYS } from "../persistence"
+import { WorkspaceService } from "~/services/workspace.service"
 import { PersistableTabState } from "."
 
 export class GQLTabService extends TabService<HoppGQLDocument> {
@@ -46,10 +47,21 @@ export class GQLTabService extends TabService<HoppGQLDocument> {
 
   protected async loadPersistedState(): Promise<PersistableTabState<HoppGQLDocument> | null> {
     const persistenceService = getService(PersistenceService)
-    const savedState = await persistenceService.getNullable<
-      PersistableTabState<HoppGQLDocument>
-    >(STORE_KEYS.GQL_TABS)
-    return savedState
+    const workspaceService = getService(WorkspaceService)
+
+    const ws = workspaceService.currentWorkspace.value
+    const key = ws.type === "personal" ? "personal" : `team:${ws.teamID}`
+
+    // Try new per-workspace storage first
+    const byWS = await persistenceService.getNullable<Record<string, PersistableTabState<HoppGQLDocument>>>(
+      STORE_KEYS.GQL_TABS_BY_WS as any
+    )
+    if (byWS && byWS[key]) return byWS[key]
+
+    // Fallback to legacy single-state
+    return await persistenceService.getNullable<PersistableTabState<HoppGQLDocument>>(
+      STORE_KEYS.GQL_TABS
+    )
   }
 
   public getTabRefWithSaveContext(ctx: HoppGQLSaveContext) {

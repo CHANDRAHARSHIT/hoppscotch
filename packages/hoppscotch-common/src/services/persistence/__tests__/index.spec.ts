@@ -73,6 +73,7 @@ import {
 import { SecretEnvironmentService } from "~/services/secret-environment.service"
 import { getKernelMode, initKernel } from "@hoppscotch/kernel"
 import { Store } from "~/kernel"
+import { WorkspaceService } from "~/services/workspace.service"
 
 initKernel(getKernelMode())
 
@@ -185,16 +186,50 @@ const bindPersistenceService = ({
     container.bindMock(SecretEnvironmentService, mock)
   }
 
+  // Always provide a WorkspaceService mock with a controlled currentWorkspace-like object
+  const currentWorkspace = { value: { type: "personal" as const } }
+  const mockWorkspaceService: Partial<WorkspaceService> = {
+    currentWorkspace: currentWorkspace as any,
+    changeWorkspace: (ws: any) => {
+      ;(currentWorkspace as any).value = ws
+    },
+  }
+  container.bindMock(WorkspaceService, mockWorkspaceService)
+
   container.bind(PersistenceService)
 
   const service = container.bind(PersistenceService)
   return service
 }
 
+// Helper for tests that need direct access to the mocked WorkspaceService
+const bindPersistenceServiceWithWorkspace = (options?: Parameters<typeof bindPersistenceService>[0]) => {
+  const container = new TestContainer()
+
+  const mock = (options?.mock ?? {}) as Record<string, unknown>
+  if (options?.mockGQLTabService) container.bindMock(GQLTabService, mock)
+  if (options?.mockRESTTabService) container.bindMock(RESTTabService, mock)
+  if (options?.mockSecretEnvironmentsService)
+    container.bindMock(SecretEnvironmentService, mock)
+
+  const currentWorkspace = { value: { type: "personal" as const } }
+  container.bindMock(WorkspaceService, {
+    currentWorkspace: currentWorkspace as any,
+    changeWorkspace: (ws: any) => {
+      ;(currentWorkspace as any).value = ws
+    },
+  })
+
+  container.bind(PersistenceService)
+  const service = container.bind(PersistenceService)
+  const wsService = container.bind(WorkspaceService)
+  return { service, wsService }
+}
+
 const invokeSetupLocalPersistence = async (
   serviceBindMock?: Record<string, unknown>
 ) => {
-  const service = bindPersistenceService(serviceBindMock)
+  const { service } = bindPersistenceService(serviceBindMock)
   await service.setupFirst()
   await service.setupLater()
 }
@@ -1930,5 +1965,82 @@ describe("PersistenceService", () => {
       expect.stringContaining(testValue)
     )
     expect(removeItemSpy).toHaveBeenCalledWith(`${STORE_NAMESPACE}:${testKey}`)
+  })
+
+  describe("per-workspace tabs", () => {
+    it("saves and swaps REST tabs per workspace on switch", async () => {
+      const restTabsMock = {
+        loadTabsFromPersistedState: vi.fn(),
+        persistableTabState: { value: { lastActiveTabID: "A", orderedDocs: [] } },
+      }
+      const { service, wsService } = bindPersistenceServiceWithWorkspace({
+        mockRESTTabService: true,
+        mock: restTabsMock,
+      })
+
+      // Initial setup
+      await service.setupFirst()
+      await service.setupLater()
+
+      // Initially personal workspace should have been loaded
+      expect(restTabsMock.loadTabsFromPersistedState).toHaveBeenCalled()
+
+      // Switch to a team workspace
+      wsService.changeWorkspace({ type: "team", teamID: "t1", teamName: "T1", role: null })
+
+      // Update persistable state before switching back to simulate modifications
+      restTabsMock.persistableTabState.value = { lastActiveTabID: "B", orderedDocs: [] }
+
+      // Switch back to personal
+      wsService.changeWorkspace({ type: "personal" })
+
+      // Expect loads to have been called for both workspaces
+      expect(restTabsMock.loadTabsFromPersistedState).toHaveBeenCalledTimes(3) // initial + team + personal
+
+      // And storage to have a map saved
+      const stored = await Store.get<any>(
+        STORE_NAMESPACE,
+        STORE_KEYS.REST_TABS_BY_WS as any
+      )
+      expect(E.isRight(stored)).toBe(true)
+    })
+
+    it("saves and swaps GQL tabs per workspace on switch", async () => {
+      const gqlTabsMock = {
+        loadTabsFromPersistedState: vi.fn(),
+        persistableTabState: { value: { lastActiveTabID: "A", orderedDocs: [] } },
+      }
+
+      const container = new TestContainer()
+      container.bindMock(GQLTabService, gqlTabsMock)
+      container.bindMock(RESTTabService, {
+        loadTabsFromPersistedState: vi.fn(),
+        persistableTabState: { value: { lastActiveTabID: "X", orderedDocs: [] } },
+      })
+      const currentWorkspace = { value: { type: "personal" as const } }
+      container.bindMock(WorkspaceService, {
+        currentWorkspace: currentWorkspace as any,
+        changeWorkspace: (ws: any) => {
+          ;(currentWorkspace as any).value = ws
+        },
+      })
+      container.bind(PersistenceService)
+  const service = container.bind(PersistenceService)
+
+      await service.setupFirst()
+      await service.setupLater()
+
+  const wsService = container.bind(WorkspaceService)
+      wsService.changeWorkspace({ type: "team", teamID: "t2", teamName: "T2", role: null })
+      gqlTabsMock.persistableTabState.value = { lastActiveTabID: "B", orderedDocs: [] }
+      wsService.changeWorkspace({ type: "personal" })
+
+      expect(gqlTabsMock.loadTabsFromPersistedState).toHaveBeenCalledTimes(3)
+      const stored = await Store.get<any>(
+        STORE_NAMESPACE,
+        STORE_KEYS.GQL_TABS_BY_WS as any
+      )
+      expect(E.isRight(stored)).toBe(true)
+    })
   })
 })
